@@ -1,19 +1,14 @@
-"""Pseudocode description of the AlphaZero algorithm."""
-
 import math
 import numpy
-import tensorflow as tf
 from typing import List
-
-
-##########################
-####### Helpers ##########
 
 
 class AlphaZeroConfig(object):
 
     def __init__(self):
-        ### Self-Play
+        # Self-Play ==
+        self.num_actors = 5000
+
         self.num_sampling_moves = 30
         self.max_moves = 512  # for chess and shogi, 722 for Go.
         self.num_simulations = 800
@@ -26,7 +21,7 @@ class AlphaZeroConfig(object):
         self.pb_c_base = 19652
         self.pb_c_init = 1.25
 
-        ### Training
+        # Training ==
         self.training_steps = int(700e3)
         self.checkpoint_interval = int(1e3)
         self.window_size = int(1e6)
@@ -45,7 +40,7 @@ class AlphaZeroConfig(object):
 
 class Node(object):
 
-    def __init__(self, prior: float):
+    def __init__(self, prior: float):  # prior = how good the network thought it would be
         self.visit_count = 0
         self.to_play = -1
         self.prior = prior
@@ -66,13 +61,20 @@ class Game(object):
     def __init__(self, history=None):
         self.history = history or []
         self.child_visits = []
-        self.num_actions = 4672  # action space size for chess; 11259 for shogi, 362 for Go
+        self.num_actions = 7
 
     def terminal(self):
+        """
+        returns bool if the game is finished or not
+        """
         # Game specific termination rules.
         pass
 
     def terminal_value(self, to_play):
+        """
+        The result of the game from the player that's going to_play? If player 1
+        won then and to_play is 1 then return 1 if to_play is 2 then return -1?
+        """
         # Game specific value.
         pass
 
@@ -86,29 +88,35 @@ class Game(object):
     def apply(self, action):
         self.history.append(action)
 
-    def store_search_statistics(self, root):
-        sum_visits = sum(child.visit_count for child in root.children.itervalues())
+    def store_search_statistics(self, root: Node):
+        sum_visits = sum(child.visit_count for child in iter(root.children.values()))
         self.child_visits.append([
             root.children[a].visit_count / sum_visits if a in root.children else 0
             for a in range(self.num_actions)
         ])
 
     def make_image(self, state_index: int):
+        """
+        returns what the game looked like at state_index i
+        """
         # Game specific feature planes.
         return []
 
     def make_target(self, state_index: int):
-        return (self.terminal_value(state_index % 2),
+        """
+        returns the nural network target i.e. what the NN should be gessing given the image
+        """
+        return (self.terminal_value(state_index % 2),  # state_index % 2 will always be who's playing
                 self.child_visits[state_index])
 
     def to_play(self):
+        """
+        Return the player that is about to play
+        """
         return len(self.history) % 2
 
 
 class ReplayBuffer(object):
-    """
-  TODO: what does this thing do?
-  """
 
     def __init__(self, config: AlphaZeroConfig):
         self.window_size = config.window_size
@@ -132,9 +140,6 @@ class ReplayBuffer(object):
 
 
 class Network(object):
-    """
-    TODO: adapt to pytorch
-    """
 
     def inference(self, image):
         return (-1, {})  # Value, Policy
@@ -151,7 +156,7 @@ class SharedStorage(object):
 
     def latest_network(self) -> Network:
         if self._networks:
-            return self._networks[max(iter(self._networks))]
+            return self._networks[max(iter(self._networks.keys()))]
         else:
             return make_uniform_network()  # policy -> uniform, value -> 0.5
 
@@ -172,7 +177,8 @@ def alphazero(config: AlphaZeroConfig):
     storage = SharedStorage()
     replay_buffer = ReplayBuffer(config)
 
-    run_selfplay(config, storage, replay_buffer)
+    for i in range(config.num_actors):
+        launch_job(run_selfplay, config, storage, replay_buffer)
 
     train_network(config, storage, replay_buffer)
 
@@ -212,6 +218,8 @@ def play_game(config: AlphaZeroConfig, network: Network):
 # reach a leaf node.
 def run_mcts(config: AlphaZeroConfig, game: Game, network: Network):
     root = Node(0)
+    # Populate child nodes AKA the states that the actions available at this
+    # states would take you too
     evaluate(root, game, network)
     add_exploration_noise(config, root)
 
@@ -221,6 +229,13 @@ def run_mcts(config: AlphaZeroConfig, game: Game, network: Network):
         search_path = [node]
 
         while node.expanded():
+            # Here we take one step down our search tree towards a win or loss. Note
+            # that we are reseting the node variable here to be the state that our
+            # game picked given the action we took.
+            #
+            # On the first run all child nodes will not be expanded, so we'll only
+            # take one step before backpropatagating back up the tree. This is a form
+            # of "bootstrapping"
             action, node = select_child(config, node)
             scratch_game.apply(action)
             search_path.append(node)
@@ -232,7 +247,7 @@ def run_mcts(config: AlphaZeroConfig, game: Game, network: Network):
 
 def select_action(config: AlphaZeroConfig, game: Game, root: Node):
     visit_counts = [(child.visit_count, action)
-                    for action, child in root.children.iteritems()]
+                    for action, child in iter(root.children.items())]
     if len(game.history) < config.num_sampling_moves:
         _, action = softmax_sample(visit_counts)
     else:
@@ -242,8 +257,11 @@ def select_action(config: AlphaZeroConfig, game: Game, root: Node):
 
 # Select the child with the highest UCB score.
 def select_child(config: AlphaZeroConfig, node: Node):
+    """
+    Return the child node, i.e. action to take, that UCB likes best
+    """
     _, action, child = max((ucb_score(config, node, child), action, child)
-                           for action, child in node.children.iteritems())
+                           for action, child in iter(node.children.items()))
     return action, child
 
 
@@ -261,13 +279,19 @@ def ucb_score(config: AlphaZeroConfig, parent: Node, child: Node):
 
 # We use the neural network to obtain a value and policy prediction.
 def evaluate(node: Node, game: Game, network: Network):
+    """
+    Populate child nodes with priors and return value both derived from NN
+    Child nodes are the states that one could reach by taking the actions
+    available from the state that you are in.
+    """
     value, policy_logits = network.inference(game.make_image(-1))
 
     # Expand the node.
     node.to_play = game.to_play()
     policy = {a: math.exp(policy_logits[a]) for a in game.legal_actions()}
-    policy_sum = sum(policy.itervalues())
-    for action, p in policy.iteritems():
+    policy_sum = sum(iter(policy.values()))
+    for action, p in iter(policy.items()):
+        # this is just softmax
         node.children[action] = Node(p / policy_sum)
     return value
 
@@ -283,6 +307,10 @@ def backpropagate(search_path: List[Node], value: float, to_play):
 # At the start of each search, we add dirichlet noise to the prior of the root
 # to encourage the search to explore new actions.
 def add_exploration_noise(config: AlphaZeroConfig, node: Node):
+    """
+    Modifies the priors stored in nodes children with dirichlet noise whatever
+    that is
+    """
     actions = node.children.keys()
     noise = numpy.random.gamma(config.root_dirichlet_alpha, 1, len(actions))
     frac = config.root_exploration_fraction
@@ -338,6 +366,11 @@ def update_weights(optimizer: tf.train.Optimizer, network: Network, batch,
 # for the paper.
 def softmax_sample(d):
     return 0, 0
+
+
+def launch_job(f, *args):
+    f(*args)
+
 
 def make_uniform_network():
     return Network()
