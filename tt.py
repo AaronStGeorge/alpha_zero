@@ -1,6 +1,7 @@
 import math
 import numpy
 from typing import List
+import numpy as np
 
 
 class AlphaZeroConfig(object):
@@ -55,37 +56,77 @@ class Node(object):
             return 0
         return self.value_sum / self.visit_count
 
-
 class Game(object):
 
     def __init__(self, history=None):
+        # Connect 4 specific ===
+        self.num_rows = 6
+        self.num_cols = 7
+        self.win_masks = []
+        self._winner = None
+
+        # Horizontal wins
+        for i in range(4):
+            mask = np.zeros((4, 4), dtype=np.bool)
+            mask[i, :] = True
+            self.win_masks.append(mask)
+        # Vertical wins
+        for j in range(4):
+            mask = np.zeros((4, 4), dtype=np.bool)
+            mask[:, j] = True
+            self.win_masks.append(mask)
+        # Diagonal wins
+        down = np.zeros((4, 4), dtype=np.bool)
+        for i, j in zip(range(4), range(4)):
+            down[i, j] = True
+        self.win_masks.append(down)
+        up = np.zeros((4, 4), dtype=np.bool)
+        for i, j in zip(reversed(range(4)), range(4)):
+            up[i, j] = True
+        self.win_masks.append(up)
+
+        # All games will have these ===
         self.history = history or []
         self.child_visits = []
-        self.num_actions = 7
+        self.num_actions = self.num_cols  # 7 for connect 4, 512 for chess/shogi, and 722 for Go.
 
     def terminal(self):
         """
         returns bool if the game is finished or not
         """
-        # Game specific termination rules.
-        pass
+        if self._winner is not None:
+            return True
+
+        image = self.make_image(len(self.history))
+        # check for wins from the bottom of the board up. Wins are more likely to appear there.
+        for i in reversed(range(self.num_rows - 3)):
+            for j in range(self.num_cols - 3):
+                for mask in self.win_masks:
+                    test = image[i:i+4, j:j+4][mask]
+                    if np.alltrue(test == 1):
+                        self._winner = 1
+                        return True
+                    if np.alltrue(test == 0):
+                        self._winner = 0
+                        return True
+
+        return False
 
     def terminal_value(self, to_play):
         """
         The result of the game from the player that's going to_play? If player 1
         won then and to_play is 1 then return 1 if to_play is 2 then return -1?
         """
-        # Game specific value.
-        pass
+        return to_play == self._winner
 
     def legal_actions(self):
-        # Game specific calculation of legal actions.
-        return []
+        image = self.make_image(len(self.history))
+        return [j for j in range(self.num_cols) if image[0, j] == -1]
 
     def clone(self):
         return Game(list(self.history))
 
-    def apply(self, action):
+    def apply(self, action: int):
         self.history.append(action)
 
     def store_search_statistics(self, root: Node):
@@ -99,8 +140,14 @@ class Game(object):
         """
         returns what the game looked like at state_index i
         """
-        # Game specific feature planes.
-        return []
+        board_state = -1 * np.ones((self.num_rows, self.num_cols), dtype=numpy.int8)
+        for move_i, move in enumerate(self.history[:state_index]):
+            for i in reversed(range(self.num_rows)):
+                if board_state[i, move] == -1:
+                    board_state[i, move] = move_i % 2
+                    break
+
+        return board_state
 
     def make_target(self, state_index: int):
         """
@@ -114,6 +161,27 @@ class Game(object):
         Return the player that is about to play
         """
         return len(self.history) % 2
+
+    def __str__(self):
+        board_state = self.make_image(len(self.history))
+
+        display_value = {
+            -1: "   ",
+            0: " ◯ ",
+            1: " ● ",
+        }
+
+        out = ""
+        for i in range(self.num_rows):
+            out += f"{i}|"
+            for j in range(self.num_cols):
+                out += display_value[board_state[i, j]]
+            out += "|\n"
+
+        out += "  "
+        for j in range(self.num_cols):
+            out += f" \u0305{j} "
+        return out
 
 
 class ReplayBuffer(object):
@@ -367,10 +435,26 @@ def update_weights(optimizer: tf.train.Optimizer, network: Network, batch,
 def softmax_sample(d):
     return 0, 0
 
-
-def launch_job(f, *args):
-    f(*args)
-
-
 def make_uniform_network():
     return Network()
+
+
+def interactive_game():
+    game = Game()
+    while not game.terminal():
+        print(game)
+        while True:
+            print("choose move please: ", end='')
+            move = input()
+            try:
+                if int(move) not in game.legal_actions():
+                    print("illegal action")
+                else:
+                    break
+            except ValueError:
+                print("illegal action")
+        game.apply(int(move))
+    print(game)
+
+if __name__ == "__main__":
+    interactive_game()
