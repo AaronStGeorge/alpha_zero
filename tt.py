@@ -11,7 +11,7 @@ class AlphaZeroConfig(object):
         self.num_actors = 5000
 
         self.num_sampling_moves = 30
-        self.max_moves = 512  # for chess and shogi, 722 for Go.
+        self.max_moves = 42 # 512 for chess and shogi, 722 for Go.
         self.num_simulations = 800
 
         # Root prior exploration noise.
@@ -60,48 +60,50 @@ class Game(object):
 
     def __init__(self, history=None):
         # Connect 4 specific ===
-        self.num_rows = 6
-        self.num_cols = 7
-        self.win_masks = []
+        self._num_rows = 6
+        self._num_cols = 7
+
         self._winner = None
 
+        # Masks to "convolve" over board and detect a winner
+        self._win_masks = []
         # Horizontal wins
         for i in range(4):
             mask = np.zeros((4, 4), dtype=np.bool)
             mask[i, :] = True
-            self.win_masks.append(mask)
+            self._win_masks.append(mask)
         # Vertical wins
         for j in range(4):
             mask = np.zeros((4, 4), dtype=np.bool)
             mask[:, j] = True
-            self.win_masks.append(mask)
+            self._win_masks.append(mask)
         # Diagonal wins
         down = np.zeros((4, 4), dtype=np.bool)
         for i, j in zip(range(4), range(4)):
             down[i, j] = True
-        self.win_masks.append(down)
+        self._win_masks.append(down)
         up = np.zeros((4, 4), dtype=np.bool)
         for i, j in zip(reversed(range(4)), range(4)):
             up[i, j] = True
-        self.win_masks.append(up)
+        self._win_masks.append(up)
 
         # All games will have these ===
         self.history = history or []
         self.child_visits = []
-        self.num_actions = self.num_cols  # 7 for connect 4, 512 for chess/shogi, and 722 for Go.
+        self.num_actions = self._num_cols  # 7 for connect 4, 512 for chess/shogi, and 722 for Go.
 
     def terminal(self):
         """
         returns bool if the game is finished or not
         """
-        if self._winner is not None:
+        if self._winner is not None or len(self.history) == 42:
             return True
 
         image = self.make_image(len(self.history))
         # check for wins from the bottom of the board up. Wins are more likely to appear there.
-        for i in reversed(range(self.num_rows - 3)):
-            for j in range(self.num_cols - 3):
-                for mask in self.win_masks:
+        for i in reversed(range(self._num_rows - 3)):
+            for j in range(self._num_cols - 3):
+                for mask in self._win_masks:
                     test = image[i:i+4, j:j+4][mask]
                     if np.alltrue(test == 1):
                         self._winner = 1
@@ -117,11 +119,13 @@ class Game(object):
         The result of the game from the player that's going to_play? If player 1
         won then and to_play is 1 then return 1 if to_play is 2 then return -1?
         """
+        if self._winner is None and len(self.history) == 42:
+            return 0
         return to_play == self._winner
 
     def legal_actions(self):
         image = self.make_image(len(self.history))
-        return [j for j in range(self.num_cols) if image[0, j] == -1]
+        return [j for j in range(self._num_cols) if image[0, j] == -1]
 
     def clone(self):
         return Game(list(self.history))
@@ -140,9 +144,9 @@ class Game(object):
         """
         returns what the game looked like at state_index i
         """
-        board_state = -1 * np.ones((self.num_rows, self.num_cols), dtype=numpy.int8)
+        board_state = -1 * np.ones((self._num_rows, self._num_cols), dtype=numpy.int8)
         for move_i, move in enumerate(self.history[:state_index]):
-            for i in reversed(range(self.num_rows)):
+            for i in reversed(range(self._num_rows)):
                 if board_state[i, move] == -1:
                     board_state[i, move] = move_i % 2
                     break
@@ -172,14 +176,14 @@ class Game(object):
         }
 
         out = ""
-        for i in range(self.num_rows):
+        for i in range(self._num_rows):
             out += f"{i}|"
-            for j in range(self.num_cols):
+            for j in range(self._num_cols):
                 out += display_value[board_state[i, j]]
             out += "|\n"
 
         out += "  "
-        for j in range(self.num_cols):
+        for j in range(self._num_cols):
             out += f" \u0305{j} "
         return out
 
@@ -210,7 +214,7 @@ class ReplayBuffer(object):
 class Network(object):
 
     def inference(self, image):
-        return (-1, {})  # Value, Policy
+        return -1, {0: 1/7, 1: 1/7, 2: 1/7, 3:1/7, 4: 1/7, 5:1/7, 6: 1/7}  # Value, Policy
 
     def get_weights(self):
         # Returns the weights of this network.
@@ -232,25 +236,19 @@ class SharedStorage(object):
         self._networks[step] = network
 
 
-##### End Helpers ########
-##########################
-
-
 # AlphaZero training is split into two independent parts: Network training and
 # self-play data generation.
 # These two parts only communicate by transferring the latest network checkpoint
 # from the training to the self-play, and the finished games from the self-play
 # to the training.
-def alphazero(config: AlphaZeroConfig):
-    storage = SharedStorage()
+def alphazero(config: AlphaZeroConfig, network: Network):
     replay_buffer = ReplayBuffer(config)
 
-    for i in range(config.num_actors):
-        launch_job(run_selfplay, config, storage, replay_buffer)
+    run_selfplay(config, network, replay_buffer)
 
-    train_network(config, storage, replay_buffer)
-
-    return storage.latest_network()
+    # train_network(config, storage, replay_buffer)
+    #
+    return network
 
 
 ##################################
@@ -260,10 +258,9 @@ def alphazero(config: AlphaZeroConfig):
 # Each self-play job is independent of all others; it takes the latest network
 # snapshot, produces a game and makes it available to the training job by
 # writing it to a shared replay buffer.
-def run_selfplay(config: AlphaZeroConfig, storage: SharedStorage,
+def run_selfplay(config: AlphaZeroConfig, network: Network,
                  replay_buffer: ReplayBuffer):
-    while True:
-        network = storage.latest_network()
+    for _ in range(1): # TODO: make better
         game = play_game(config, network)
         replay_buffer.save_game(game)
 
@@ -316,10 +313,11 @@ def run_mcts(config: AlphaZeroConfig, game: Game, network: Network):
 def select_action(config: AlphaZeroConfig, game: Game, root: Node):
     visit_counts = [(child.visit_count, action)
                     for action, child in iter(root.children.items())]
-    if len(game.history) < config.num_sampling_moves:
-        _, action = softmax_sample(visit_counts)
-    else:
-        _, action = max(visit_counts)
+    # TODO: does this even make sense for connect 4?
+    # if len(game.history) < config.num_sampling_moves:
+    #     _, action = softmax_sample(visit_counts)
+    # else:
+    _, action = max(visit_counts)
     return action
 
 
@@ -352,14 +350,14 @@ def evaluate(node: Node, game: Game, network: Network):
     Child nodes are the states that one could reach by taking the actions
     available from the state that you are in.
     """
-    value, policy_logits = network.inference(game.make_image(-1))
+    value, policy_logits = network.inference(game.make_image(len(game.history)))
 
     # Expand the node.
     node.to_play = game.to_play()
     policy = {a: math.exp(policy_logits[a]) for a in game.legal_actions()}
     policy_sum = sum(iter(policy.values()))
     for action, p in iter(policy.items()):
-        # this is just softmax
+        # this is just softmax, notice the math.exp 3 lines up
         node.children[action] = Node(p / policy_sum)
     return value
 
@@ -396,30 +394,30 @@ def add_exploration_noise(config: AlphaZeroConfig, node: Node):
 def train_network(config: AlphaZeroConfig, storage: SharedStorage,
                   replay_buffer: ReplayBuffer):
     network = Network()
-    optimizer = tf.train.MomentumOptimizer(config.learning_rate_schedule,
-                                           config.momentum)
-    for i in range(config.training_steps):
-        if i % config.checkpoint_interval == 0:
-            storage.save_network(i, network)
-        batch = replay_buffer.sample_batch()
-        update_weights(optimizer, network, batch, config.weight_decay)
-    storage.save_network(config.training_steps, network)
+    # optimizer = tf.train.MomentumOptimizer(config.learning_rate_schedule,
+    #                                        config.momentum)
+    # for i in range(config.training_steps):
+    #     if i % config.checkpoint_interval == 0:
+    #         storage.save_network(i, network)
+    #     batch = replay_buffer.sample_batch()
+    #     update_weights(optimizer, network, batch, config.weight_decay)
+    # storage.save_network(config.training_steps, network)
 
 
-def update_weights(optimizer: tf.train.Optimizer, network: Network, batch,
+def update_weights(optimizer, network: Network, batch,
                    weight_decay: float):
     loss = 0
-    for image, (target_value, target_policy) in batch:
-        value, policy_logits = network.inference(image)
-        loss += (
-                tf.losses.mean_squared_error(value, target_value) +
-                tf.nn.softmax_cross_entropy_with_logits(
-                    logits=policy_logits, labels=target_policy))
-
-    for weights in network.get_weights():
-        loss += weight_decay * tf.nn.l2_loss(weights)
-
-    optimizer.minimize(loss)
+    # for image, (target_value, target_policy) in batch:
+    #     value, policy_logits = network.inference(image)
+    #     loss += (
+    #             tf.losses.mean_squared_error(value, target_value) +
+    #             tf.nn.softmax_cross_entropy_with_logits(
+    #                 logits=policy_logits, labels=target_policy))
+    #
+    # for weights in network.get_weights():
+    #     loss += weight_decay * tf.nn.l2_loss(weights)
+    #
+    # optimizer.minimize(loss)
 
 
 ######### End Training ###########
@@ -439,22 +437,33 @@ def make_uniform_network():
     return Network()
 
 
-def interactive_game():
+def interactive_game(config: AlphaZeroConfig, network: Network):
     game = Game()
+    print(game)
     while not game.terminal():
-        print(game)
         while True:
             print("choose move please: ", end='')
-            move = input()
+            human_action = input()
             try:
-                if int(move) not in game.legal_actions():
+                if int(human_action) not in game.legal_actions():
                     print("illegal action")
                 else:
                     break
             except ValueError:
                 print("illegal action")
-        game.apply(int(move))
+        game.apply(int(human_action))
+        # print(game)
+        ai_action, _ = run_mcts(config, game, network)
+        print(f"ai chooses {ai_action}")
+        game.apply(ai_action)
+        print(game)
+    win_string = {-1: "lost", 1: "won", 0: "tied"}
+    print(f"you {win_string[game.terminal_value(0)]}")
     print(game)
 
 if __name__ == "__main__":
-    interactive_game()
+    network = make_uniform_network()
+    config = AlphaZeroConfig()
+    interactive_game(config, network)
+    alphazero(config, network)
+    # print('did it')
