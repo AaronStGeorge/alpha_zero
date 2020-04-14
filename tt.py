@@ -11,7 +11,7 @@ class AlphaZeroConfig(object):
         self.num_actors = 5000
 
         self.num_sampling_moves = 30
-        self.max_moves = 42 # 512 for chess and shogi, 722 for Go.
+        self.max_moves = 42  # 512 for chess and shogi, 722 for Go.
         self.num_simulations = 800
 
         # Root prior exploration noise.
@@ -55,6 +55,7 @@ class Node(object):
         if self.visit_count == 0:
             return 0
         return self.value_sum / self.visit_count
+
 
 class Game(object):
 
@@ -104,7 +105,7 @@ class Game(object):
         for i in reversed(range(self._num_rows - 3)):
             for j in range(self._num_cols - 3):
                 for mask in self._win_masks:
-                    test = image[i:i+4, j:j+4][mask]
+                    test = image[i:i + 4, j:j + 4][mask]
                     if np.alltrue(test == 1):
                         self._winner = 1
                         return True
@@ -214,7 +215,7 @@ class ReplayBuffer(object):
 class Network(object):
 
     def inference(self, image):
-        return -1, {0: 1/7, 1: 1/7, 2: 1/7, 3:1/7, 4: 1/7, 5:1/7, 6: 1/7}  # Value, Policy
+        return -1, {0: 1 / 7, 1: 1 / 7, 2: 1 / 7, 3: 1 / 7, 4: 1 / 7, 5: 1 / 7, 6: 1 / 7}  # Value, Policy
 
     def get_weights(self):
         # Returns the weights of this network.
@@ -260,7 +261,7 @@ def alphazero(config: AlphaZeroConfig, network: Network):
 # writing it to a shared replay buffer.
 def run_selfplay(config: AlphaZeroConfig, network: Network,
                  replay_buffer: ReplayBuffer):
-    for _ in range(1): # TODO: make better
+    for _ in range(1):  # TODO: make better
         game = play_game(config, network)
         replay_buffer.save_game(game)
 
@@ -391,9 +392,160 @@ def add_exploration_noise(config: AlphaZeroConfig, node: Node):
 ####### Part 2: Training #########
 
 
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
+
+
+class board_data(Dataset):
+    """
+    This turns the np tensor into a torch dataset
+    """
+    def __init__(self, dataset):
+        self.X = dataset[:, 0]
+        self.y_p, self.y_v = dataset[:, 1], dataset[:, 2]
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, index):
+        return np.int64(self.X[index].transpose(2, 0, 1)), self.y_p[index], self.y_v[index]
+
+
+class ConvBlock(nn.Module):
+    """
+    Here we define the convolution block
+    """
+    def __init__(self):
+        super(ConvBlock, self).__init__()
+        self.action_size = 7
+        self.conv1 = nn.Conv2d(3, 128, 3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(128)
+
+    def forward(self, s):
+        s = s.view(-1, 3, 6, 7)
+        s = self.conv1(s)
+        s = self.bn1(s)
+        s = nn.functional.relu(s)
+        return s
+
+
+class ResBlock(nn.Module):
+    """
+    Here we define the ResNet blocks
+    """
+    def __init__(self, in_planes=128, planes=128, stride=1, downsample=None):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += residual
+        out = nn.functional.relu(out)
+
+        return out
+
+
+class DualHead(nn.Module):
+    """
+    Here we define the two heads of the NN, the policy head and the value head
+    """
+    def __init__(self):
+        super(DualHead, self).__init__()
+        """
+        Value Head
+        """
+        self.value_conv = nn.Conv2d(128, 3, kernel_size=1)
+        self.value_bn = nn.BatchNorm2d(3)
+        self.value_fc1 = nn.Linear(3*6*7, 32)
+        self.value_fc2 = nn.Linear(31, 1)
+
+        """
+        Policy Head
+        """
+        self.policy_conv = nn.Conv2d(128, 32, kernel_size=1)
+        self.policy_bn = nn.BatchNorm2d(32)
+        self.policy_log_softmax = nn.LogSoftmax(dim=1)
+        self.policy_fc = nn.Linear(6*7*32, 7)
+
+    def forward(self, s):
+        """
+        Value Head
+        """
+        v = self.value_conv(s)
+        v = self.value_bn(v)
+        v = nn.functional.relu(v)
+        v = v.view(-1, 3*6*7)
+        v = self.value_fc1(v)
+        v = nn.functional.relu(v)
+        v = self.value_fc2(v)
+        v = torch.tanh(v)
+
+        """
+        Policy Head
+        """
+        p = self.policy_conv(s)
+        p = self.policy_bn(p)
+        p = nn.functional.relu(p)
+        p = p.view(-1, 6*7*32)
+        p = self.policy_fc(p)
+        p = self.policy_log_softmax(p).exp()
+
+        return p, v
+
+class ConnectNet(nn.Module):
+    """
+    Here we bring the ResNet blocks and the dual headed network together
+    """
+    def __init__(self):
+        super(ConnectNet, self).__init__()
+        self.conv = ConvBlock()
+        for block in range(10):
+            setattr(self, "res_%i" % block, ResBlock())
+        self.out_block = DualHead()
+
+    def forward(self, s):
+        s = self.conv(s)
+        for block in range(10):
+            s = getattr(self, "res_i%" % block)(s) # this looks a little funny
+        s = self.out_block(s)
+
+        return s
+
+class AlphaLoss(nn.Module):
+    """
+    Here we define the loss function
+    """
+    def __init__(self):
+        super(AlphaLoss, self).__init__()
+
+    def forward(self, z, value, pi, policy, theta):
+        value_error = (z - value) ** 2
+        policy_error = nn.functional.binary_cross_entropy_with_logits(policy, pi)
+        # we take care of L2 regularization with the optimizer?
+
+        return value_error - policy_error
+
+
 def train_network(config: AlphaZeroConfig, storage: SharedStorage,
                   replay_buffer: ReplayBuffer):
-    network = Network()
+    network = ConnectNet()
+    optimizer = torch.optim.SGD(network.parameters(), momentum=0.9, weight_decay=10e-4)
+
+    for i in range(config.training_steps):
+        if i % config.checkpoint_interval == 0:
+            storage.save_network(i, network.parameters())
+
+        batch = replay_buffer.sample_batch()
+        update_weights(optimizer, network, batch)
+
     # optimizer = tf.train.MomentumOptimizer(config.learning_rate_schedule,
     #                                        config.momentum)
     # for i in range(config.training_steps):
@@ -404,10 +556,16 @@ def train_network(config: AlphaZeroConfig, storage: SharedStorage,
     # storage.save_network(config.training_steps, network)
 
 
-def update_weights(optimizer, network: Network, batch,
-                   weight_decay: float):
+def update_weights(optimizer, network, batch):
     loss = 0
-    # for image, (target_value, target_policy) in batch:
+
+    for image, (target_value, target_policy) in batch:
+        value, policy = network.forward(image)
+        loss += AlphaLoss.forward(target_value, value, target_policy, policy)
+
+
+    loss += optimizer((value, policy), image)
+    loss.backward()
     #     value, policy_logits = network.inference(image)
     #     loss += (
     #             tf.losses.mean_squared_error(value, target_value) +
@@ -432,6 +590,7 @@ def update_weights(optimizer, network: Network, batch,
 # for the paper.
 def softmax_sample(d):
     return 0, 0
+
 
 def make_uniform_network():
     return Network()
@@ -460,6 +619,7 @@ def interactive_game(config: AlphaZeroConfig, network: Network):
     win_string = {-1: "lost", 1: "won", 0: "tied"}
     print(f"you {win_string[game.terminal_value(0)]}")
     print(game)
+
 
 if __name__ == "__main__":
     network = make_uniform_network()
