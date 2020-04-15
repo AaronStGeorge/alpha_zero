@@ -2,6 +2,10 @@ import math
 import numpy
 from typing import List
 import numpy as np
+from torch.utils.data import TensorDataset
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
 
 
 class AlphaZeroConfig(object):
@@ -12,7 +16,7 @@ class AlphaZeroConfig(object):
 
         self.num_sampling_moves = 30
         self.max_moves = 42  # 512 for chess and shogi, 722 for Go.
-        self.num_simulations = 800
+        self.num_simulations = 20 # 800
 
         # Root prior exploration noise.
         self.root_dirichlet_alpha = 0.3  # for chess, 0.03 for Go and 0.15 for shogi.
@@ -25,7 +29,7 @@ class AlphaZeroConfig(object):
         # Training ==
         self.training_steps = int(700e3)
         self.checkpoint_interval = int(1e3)
-        self.window_size = int(1e6)
+        self.window_size = int(50)
         self.batch_size = 4096
 
         self.weight_decay = 1e-4
@@ -143,8 +147,8 @@ class Game(object):
         """
         returns what the game looked like at state_index i
         """
-        player_0 = np.zeros((self._num_rows, self._num_cols), dtype=numpy.int8)
-        player_1 = np.zeros((self._num_rows, self._num_cols), dtype=numpy.int8)
+        player_0 = np.zeros((self._num_rows, self._num_cols), dtype=numpy.float)
+        player_1 = np.zeros((self._num_rows, self._num_cols), dtype=numpy.float)
         for move_i, move in enumerate(self.history[:state_index+1]):
             for row in reversed(range(self._num_rows)):
                 if player_0[row, move] == 0 and player_1[row, move] == 0:
@@ -154,9 +158,9 @@ class Game(object):
                         player_1[row, move] = 1
                     break
 
-        to_play = (state_index + 1) % 2 * np.ones((self._num_rows, self._num_cols), dtype=numpy.int8)
+        to_play = (state_index + 1) % 2 * np.ones((self._num_rows, self._num_cols), dtype=numpy.float)
 
-        return np.array([player_0, player_1, to_play], dtype=numpy.int8)
+        return np.array([player_0, player_1, to_play], dtype=numpy.float)
 
     def make_target(self, state_index: int):
         """
@@ -212,7 +216,23 @@ class ReplayBuffer(object):
             size=self.batch_size,
             p=[len(g.history) / move_sum for g in self.buffer])
         game_pos = [(g, numpy.random.randint(len(g.history))) for g in games]
-        return [(g.make_image(i), g.make_target(i)) for (g, i) in game_pos]
+
+        image = np.array([g.make_image(i) for (g, i) in game_pos], dtype=np.float)
+        image = torch.from_numpy(image)
+        image = image.to(torch.float)
+
+        policy_target = np.array([g.make_target(i)[1] for (g, i) in game_pos])
+        policy_target = torch.from_numpy(policy_target)
+        policy_target = policy_target.to(torch.float)
+
+        value_target = np.array([g.make_target(i)[0] for (g, i) in game_pos])
+        value_target = torch.from_numpy(value_target)
+        value_target = value_target.to(torch.float)
+
+        batch_data = TensorDataset(image, policy_target, value_target)
+        return torch.utils.data.DataLoader(dataset=batch_data,
+                                           batch_size=50,
+                                           shuffle=True)
 
 
 class Network(object):
@@ -224,20 +244,85 @@ class Network(object):
         # Returns the weights of this network.
         return []
 
-
-class SharedStorage(object):
-
+class Net(nn.Module):
     def __init__(self):
-        self._networks = {}
+        """CNN Builder."""
+        super(Net, self).__init__()
 
-    def latest_network(self) -> Network:
-        if self._networks:
-            return self._networks[max(iter(self._networks.keys()))]
-        else:
-            return make_uniform_network()  # policy -> uniform, value -> 0.5
+        """
+        Shared
+        """
+        self.shared_conv = nn.Sequential(
+            # Conv Layer block 1
+            #  input shape:
+            #    3, 6, 7
+            #  output shape:
+            #    32, 6, 7
+            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
 
-    def save_network(self, step: int, network: Network):
-        self._networks[step] = network
+
+        """
+        Value Head
+        """
+        self.value_conv = nn.Sequential(
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.value_fc = nn.Sequential(
+            nn.Linear(32 * 6 * 7, 120),
+            nn.RReLU(inplace=True),
+            nn.Linear(120, 1),
+        )
+
+        """
+        Policy Head
+        """
+        self.policy_conv = nn.Sequential(
+            nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.policy_fc = nn.Sequential(
+            nn.Linear(32 * 6 * 7, 120),
+            nn.RReLU(inplace=True),
+            nn.Linear(120, 7),
+        )
+
+    def inference(self, image):
+        image = torch.from_numpy(image)
+        image = image.to(torch.float)
+        # TODO: why the fuck do we have to squeeze and unsqueeze everything all the damn time
+        image = image.unsqueeze(0)
+        # TODO: make p and v ordering consistent
+        p, v = self.forward(image)
+        return float(v.squeeze().detach()), p.squeeze().detach().numpy()
+
+    def forward(self, x):
+        """Perform forward."""
+
+        # shared conv
+        sc = self.shared_conv(x)
+
+        # policy head ==
+        p = self.policy_conv(sc)
+
+        # flatten
+        p = p.view(p.size(0), -1)
+
+        # fc layer
+        p = self.policy_fc(p)
+
+        # value head ==
+        v = self.value_conv(sc)
+
+        # flatten
+        v = v.view(v.size(0), -1)
+
+        # fc layer
+        v = self.value_fc(v)
+
+        return p, v
 
 
 # AlphaZero training is split into two independent parts: Network training and
@@ -245,13 +330,18 @@ class SharedStorage(object):
 # These two parts only communicate by transferring the latest network checkpoint
 # from the training to the self-play, and the finished games from the self-play
 # to the training.
-def alphazero(config: AlphaZeroConfig, network: Network):
+def alphazero(config: AlphaZeroConfig, network: Net):
     replay_buffer = ReplayBuffer(config)
 
-    run_selfplay(config, network, replay_buffer)
+    cycles = 50
+    for i in range(cycles):
+        print(f"self play {i} of {cycles}")
+        network.eval()
+        run_selfplay(config, network, replay_buffer)
+        print(f"train network {i} of {cycles}")
+        network.train()
+        train_network(config, replay_buffer)
 
-    # train_network(config, storage, replay_buffer)
-    #
     return network
 
 
@@ -262,9 +352,11 @@ def alphazero(config: AlphaZeroConfig, network: Network):
 # Each self-play job is independent of all others; it takes the latest network
 # snapshot, produces a game and makes it available to the training job by
 # writing it to a shared replay buffer.
-def run_selfplay(config: AlphaZeroConfig, network: Network,
+def run_selfplay(config: AlphaZeroConfig, network: Net,
                  replay_buffer: ReplayBuffer):
-    for _ in range(1):  # TODO: make better
+    for i in range(config.window_size):  # TODO: make better
+        if i % 10 == 0:
+            print(f"game {i} of {config.window_size}")
         game = play_game(config, network)
         replay_buffer.save_game(game)
 
@@ -272,7 +364,7 @@ def run_selfplay(config: AlphaZeroConfig, network: Network,
 # Each game is produced by starting at the initial board position, then
 # repeatedly executing a Monte Carlo Tree Search to generate moves until the end
 # of the game is reached.
-def play_game(config: AlphaZeroConfig, network: Network):
+def play_game(config: AlphaZeroConfig, network: Net):
     game = Game()
     while not game.terminal() and len(game.history) < config.max_moves:
         action, root = run_mcts(config, game, network)
@@ -285,14 +377,14 @@ def play_game(config: AlphaZeroConfig, network: Network):
 # To decide on an action, we run N simulations, always starting at the root of
 # the search tree and traversing the tree according to the UCB formula until we
 # reach a leaf node.
-def run_mcts(config: AlphaZeroConfig, game: Game, network: Network):
+def run_mcts(config: AlphaZeroConfig, game: Game, network: Net):
     root = Node(0)
     # Populate child nodes AKA the states that the actions available at this
     # states would take you too
     evaluate(root, game, network)
     add_exploration_noise(config, root)
 
-    for _ in range(config.num_simulations):
+    for i in range(config.num_simulations):
         node = root
         scratch_game = game.clone()
         search_path = [node]
@@ -348,7 +440,7 @@ def ucb_score(config: AlphaZeroConfig, parent: Node, child: Node):
 
 
 # We use the neural network to obtain a value and policy prediction.
-def evaluate(node: Node, game: Game, network: Network):
+def evaluate(node: Node, game: Game, network: Net):
     """
     Populate child nodes with priors and return value both derived from NN
     Child nodes are the states that one could reach by taking the actions
@@ -393,11 +485,6 @@ def add_exploration_noise(config: AlphaZeroConfig, node: Node):
 
 ##################################
 ####### Part 2: Training #########
-
-
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset
 
 
 class board_data(Dataset):
@@ -545,17 +632,12 @@ class AlphaLoss(nn.Module):
         return value_error - policy_error
 
 
-def train_network(config: AlphaZeroConfig, storage: SharedStorage,
-                  replay_buffer: ReplayBuffer):
-    network = ConnectNet()
-    optimizer = torch.optim.SGD(network.parameters(), momentum=0.9, weight_decay=10e-4)
+def train_network(config: AlphaZeroConfig, replay_buffer: ReplayBuffer):
+    # optimizer = torch.optim.SGD(network.parameters(), momentum=0.9, weight_decay=10e-4)
+    optimizer = torch.optim.Adam(network.parameters())
 
-    for i in range(config.training_steps):
-        if i % config.checkpoint_interval == 0:
-            storage.save_network(i, network.parameters())
-
+    for i in range(1): #(config.training_steps):
         batch = replay_buffer.sample_batch()
-
         update_weights(optimizer, network, batch)
 
     # optimizer = tf.train.MomentumOptimizer(config.learning_rate_schedule,
@@ -569,15 +651,38 @@ def train_network(config: AlphaZeroConfig, storage: SharedStorage,
 
 
 def update_weights(optimizer, network, batch):
-    loss = 0
+    # Loop over each subset of data
+    for image, policy_target, value_target in batch:
+        # Zero out the optimizer's gradient buffer
+        optimizer.zero_grad()
 
-    for image, (target_value, target_policy) in batch:
-        value, policy = network.forward(image)
-        loss += AlphaLoss(target_value, value, target_policy, policy)
+        # Make a prediction based on the model
+        policy, value = network(image)
 
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
+        # Compute the loss
+        # .sum() is some black magic https://discuss.pytorch.org/t/loss-backward-raises-error-grad-can-be-implicitly-created-only-for-scalar-outputs/12152/2
+        loss = (nn.functional.binary_cross_entropy_with_logits(policy, policy_target) + (value_target - value) ** 2).sum()
+
+        # Use backpropagation to compute the derivative of the loss with respect to the parameters
+        loss.backward()
+
+        # Use the derivative information to update the parameters
+        optimizer.step()
+
+
+
+
+    # loss = 0
+    # for image, (target_value, target_policy) in batch[:1]:
+    #     thing = torch.from_numpy(image)
+    #     thing = thing.to(torch.float)
+    #     thing = thing.unsqueeze(0)
+    #     policy = network(thing)
+        # loss += AlphaLoss(target_value, value, target_policy, policy)
+
+    # loss.backward()
+    # optimizer.step()
+    # optimizer.zero_grad()
 
     #     value, policy_logits = network.inference(image)
     #     loss += (
@@ -589,6 +694,7 @@ def update_weights(optimizer, network, batch):
     #     loss += weight_decay * tf.nn.l2_loss(weights)
     #
     # optimizer.minimize(loss)
+
 
 
 ######### End Training ###########
@@ -606,7 +712,9 @@ def softmax_sample(d):
 
 
 def make_uniform_network():
-    return Network()
+    network = Net()
+    network.float()
+    return network
 
 
 def interactive_game(config: AlphaZeroConfig, network: Network):
@@ -639,3 +747,4 @@ if __name__ == "__main__":
     config = AlphaZeroConfig()
     # interactive_game(config, network)
     alphazero(config, network)
+    interactive_game(config, network)
