@@ -105,13 +105,11 @@ class Game(object):
         for i in reversed(range(self._num_rows - 3)):
             for j in range(self._num_cols - 3):
                 for mask in self._win_masks:
-                    test = image[i:i + 4, j:j + 4][mask]
-                    if np.alltrue(test == 1):
-                        self._winner = 1
-                        return True
-                    if np.alltrue(test == 0):
-                        self._winner = 0
-                        return True
+                    for player in range(2):
+                        test = image[player, i:i + 4, j:j + 4][mask]
+                        if np.alltrue(test == 1):
+                            self._winner = player
+                            return True
 
         return False
 
@@ -126,7 +124,7 @@ class Game(object):
 
     def legal_actions(self):
         image = self.make_image(len(self.history))
-        return [j for j in range(self._num_cols) if image[0, j] == -1]
+        return [j for j in range(self._num_cols) if image[0, 0, j] == 0 and image[1, 0, j] == 0]
 
     def clone(self):
         return Game(list(self.history))
@@ -145,14 +143,20 @@ class Game(object):
         """
         returns what the game looked like at state_index i
         """
-        board_state = -1 * np.ones((self._num_rows, self._num_cols), dtype=numpy.int8)
-        for move_i, move in enumerate(self.history[:state_index]):
-            for i in reversed(range(self._num_rows)):
-                if board_state[i, move] == -1:
-                    board_state[i, move] = move_i % 2
+        player_0 = np.zeros((self._num_rows, self._num_cols), dtype=numpy.int8)
+        player_1 = np.zeros((self._num_rows, self._num_cols), dtype=numpy.int8)
+        for move_i, move in enumerate(self.history[:state_index+1]):
+            for row in reversed(range(self._num_rows)):
+                if player_0[row, move] == 0 and player_1[row, move] == 0:
+                    if move_i % 2 == 0:
+                        player_0[row, move] = 1
+                    if move_i % 2 == 1:
+                        player_1[row, move] = 1
                     break
 
-        return board_state
+        to_play = (state_index + 1) % 2 * np.ones((self._num_rows, self._num_cols), dtype=numpy.int8)
+
+        return np.array([player_0, player_1, to_play], dtype=numpy.int8)
 
     def make_target(self, state_index: int):
         """
@@ -170,17 +174,16 @@ class Game(object):
     def __str__(self):
         board_state = self.make_image(len(self.history))
 
-        display_value = {
-            -1: "   ",
-            0: " ◯ ",
-            1: " ● ",
-        }
-
         out = ""
         for i in range(self._num_rows):
             out += f"{i}|"
             for j in range(self._num_cols):
-                out += display_value[board_state[i, j]]
+                if board_state[0, i, j] == 1:
+                    out += " ○ "
+                elif board_state[1, i, j] == 1:
+                    out += " ● "
+                else:
+                    out += "   "
             out += "|\n"
 
         out += "  "
@@ -296,7 +299,7 @@ def run_mcts(config: AlphaZeroConfig, game: Game, network: Network):
 
         while node.expanded():
             # Here we take one step down our search tree towards a win or loss. Note
-            # that we are reseting the node variable here to be the state that our
+            # that we are resetting the node variable here to be the state that our
             # game picked given the action we took.
             #
             # On the first run all child nodes will not be expanded, so we'll only
@@ -634,6 +637,5 @@ def interactive_game(config: AlphaZeroConfig, network: Network):
 if __name__ == "__main__":
     network = make_uniform_network()
     config = AlphaZeroConfig()
-    interactive_game(config, network)
+    # interactive_game(config, network)
     alphazero(config, network)
-    # print('did it')
