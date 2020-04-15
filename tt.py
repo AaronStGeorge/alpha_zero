@@ -401,6 +401,7 @@ class board_data(Dataset):
     """
     This turns the np tensor into a torch dataset
     """
+
     def __init__(self, dataset):
         self.X = dataset[:, 0]
         self.y_p, self.y_v = dataset[:, 1], dataset[:, 2]
@@ -416,6 +417,7 @@ class ConvBlock(nn.Module):
     """
     Here we define the convolution block
     """
+
     def __init__(self):
         super(ConvBlock, self).__init__()
         self.action_size = 7
@@ -434,6 +436,7 @@ class ResBlock(nn.Module):
     """
     Here we define the ResNet blocks
     """
+
     def __init__(self, in_planes=128, planes=128, stride=1, downsample=None):
         super(ResBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
@@ -457,6 +460,7 @@ class DualHead(nn.Module):
     """
     Here we define the two heads of the NN, the policy head and the value head
     """
+
     def __init__(self):
         super(DualHead, self).__init__()
         """
@@ -464,7 +468,7 @@ class DualHead(nn.Module):
         """
         self.value_conv = nn.Conv2d(128, 3, kernel_size=1)
         self.value_bn = nn.BatchNorm2d(3)
-        self.value_fc1 = nn.Linear(3*6*7, 32)
+        self.value_fc1 = nn.Linear(3 * 6 * 7, 32)
         self.value_fc2 = nn.Linear(31, 1)
 
         """
@@ -473,7 +477,7 @@ class DualHead(nn.Module):
         self.policy_conv = nn.Conv2d(128, 32, kernel_size=1)
         self.policy_bn = nn.BatchNorm2d(32)
         self.policy_log_softmax = nn.LogSoftmax(dim=1)
-        self.policy_fc = nn.Linear(6*7*32, 7)
+        self.policy_fc = nn.Linear(6 * 7 * 32, 7)
 
     def forward(self, s):
         """
@@ -482,7 +486,7 @@ class DualHead(nn.Module):
         v = self.value_conv(s)
         v = self.value_bn(v)
         v = nn.functional.relu(v)
-        v = v.view(-1, 3*6*7)
+        v = v.view(-1, 3 * 6 * 7)
         v = self.value_fc1(v)
         v = nn.functional.relu(v)
         v = self.value_fc2(v)
@@ -494,16 +498,18 @@ class DualHead(nn.Module):
         p = self.policy_conv(s)
         p = self.policy_bn(p)
         p = nn.functional.relu(p)
-        p = p.view(-1, 6*7*32)
+        p = p.view(-1, 6 * 7 * 32)
         p = self.policy_fc(p)
         p = self.policy_log_softmax(p).exp()
 
         return p, v
 
+
 class ConnectNet(nn.Module):
     """
     Here we bring the ResNet blocks and the dual headed network together
     """
+
     def __init__(self):
         super(ConnectNet, self).__init__()
         self.conv = ConvBlock()
@@ -514,22 +520,24 @@ class ConnectNet(nn.Module):
     def forward(self, s):
         s = self.conv(s)
         for block in range(10):
-            s = getattr(self, "res_i%" % block)(s) # this looks a little funny
+            s = getattr(self, "res_i%" % block)(s)  # this looks a little funny
         s = self.out_block(s)
 
         return s
+
 
 class AlphaLoss(nn.Module):
     """
     Here we define the loss function
     """
+
     def __init__(self):
         super(AlphaLoss, self).__init__()
 
     def forward(self, z, value, pi, policy, theta):
         value_error = (z - value) ** 2
         policy_error = nn.functional.binary_cross_entropy_with_logits(policy, pi)
-        # we take care of L2 regularization with the optimizer?
+        # we take care of L2 regularization in the optimizer
 
         return value_error - policy_error
 
@@ -544,6 +552,7 @@ def train_network(config: AlphaZeroConfig, storage: SharedStorage,
             storage.save_network(i, network.parameters())
 
         batch = replay_buffer.sample_batch()
+
         update_weights(optimizer, network, batch)
 
     # optimizer = tf.train.MomentumOptimizer(config.learning_rate_schedule,
@@ -561,11 +570,12 @@ def update_weights(optimizer, network, batch):
 
     for image, (target_value, target_policy) in batch:
         value, policy = network.forward(image)
-        loss += AlphaLoss.forward(target_value, value, target_policy, policy)
+        loss += AlphaLoss(target_value, value, target_policy, policy)
 
-
-    loss += optimizer((value, policy), image)
     loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
     #     value, policy_logits = network.inference(image)
     #     loss += (
     #             tf.losses.mean_squared_error(value, target_value) +
