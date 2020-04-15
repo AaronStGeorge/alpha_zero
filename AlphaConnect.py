@@ -5,18 +5,17 @@ import numpy as np
 from torch.utils.data import TensorDataset
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset
 
 
 class AlphaZeroConfig(object):
-
+    """
+    This holds the configuration parameters
+    """
     def __init__(self):
         # Self-Play ==
-        self.num_actors = 5000
-
         self.num_sampling_moves = 30
-        self.max_moves = 42  # 512 for chess and shogi, 722 for Go.
-        self.num_simulations = 25 # 20
+        self.max_moves = 42
+        self.num_simulations = 25 # 25
 
         # Root prior exploration noise.
         self.root_dirichlet_alpha = 0.3  # for chess, 0.03 for Go and 0.15 for shogi.
@@ -27,22 +26,14 @@ class AlphaZeroConfig(object):
         self.pb_c_init = 1.25
 
         # Training ==
-        self.training_steps = int(9)
-        self.checkpoint_interval = int(1e3)
-        self.window_size = int(20)
-        self.batch_size = 4096
-        self.cycles = 3
+        self.training_steps = int(9)    # number of times we perform gradient descent
+        self.window_size = int(20)      # number of games played during self play
+        self.batch_size = 4000            # size of training batch
+        self.cycles = 3                 # number of
 
         self.weight_decay = 1e-4
         self.momentum = 0.9
-        # Schedule for chess and shogi, Go starts at 2e-2 immediately.
-        self.learning_rate_schedule = {
-            0: 2e-1,
-            100e3: 2e-2,
-            300e3: 2e-3,
-            500e3: 2e-4
-        }
-        self.learning_rate = 1e-3
+        self.learning_rate = 1e-1
 
 
 class Node(object):
@@ -550,9 +541,6 @@ def update_weights(optimizer, network, batch, batch_num):
 
 # Stubs to make the typechecker happy, should not be included in pseudocode
 # for the paper.
-def softmax_sample(d):
-    return 0, 0
-
 
 def make_uniform_network():
     network = Net()
@@ -599,10 +587,13 @@ def interactive_game(config: AlphaZeroConfig, network: Net):
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        dev = "cuda:0"
+    else:
+        dev = "cpu"
 
     network = make_uniform_network()
     config = AlphaZeroConfig()
-    interactive_game(config, network)
+    # interactive_game(config, network)
     alphazero(config, network)
     interactive_game(config, network)
